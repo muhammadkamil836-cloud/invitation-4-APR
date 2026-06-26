@@ -1,171 +1,52 @@
-import pandas as pd
-import requests
-from flask import Flask, request, render_template_string
 import os
+import re
+from pypdf import PdfReader, PdfWriter
 
-app = Flask(__name__)
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+def extract_number(filename):
+    match = re.search(r'\d+', filename)
+    return int(match.group()) if match else 0
 
-# SS Credentials
-USERNAME = "960553"
-PASSWORD = "13658f5b-c38b-4c40-b1a2-8a28c3262e70"
+def merge_pdfs(folder_path, output_file):
+    writer = PdfWriter()
 
-# Required CSV Columns
-REQUIRED_COLUMNS = [
-    "CustomerPO",
-    "Identifier",
-    "Qty",
-    "Attn",
-    "Address",
-    "City",
-    "State",
-    "Zip",
-    "ShippingMethod",
-    "shipBlind",
-    "PaymentProfile-Email",
-    "PaymentProfileID"
-]
+    # check folder exists
+    if not os.path.exists(folder_path):
+        print("❌ Folder not found:", folder_path)
+        return
 
-# -------------------------------
-# HTML Upload Page
-# -------------------------------
-HTML_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>SS Orders Upload</title>
-    <style>
-        body { font-family: Arial; background: #f3f3f3; padding: 40px; }
-        .box { background: white; padding: 25px; border-radius: 10px; width: 450px; margin: auto; 
-               box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-        .btn { background: #007bff; color: white; padding: 10px 20px; border: none; 
-               border-radius: 5px; cursor: pointer; }
-        .btn:hover { background: #0056b3; }
-        .result { margin-top: 20px; padding: 15px; background: #fff; border-radius: 5px; }
-    </style>
-</head>
-<body>
-    <div class="box">
-        <h2>SS Activewear Order Upload</h2>
-        <form action="/upload" method="POST" enctype="multipart/form-data">
-            <input type="file" name="file" required><br><br>
-            <button class="btn">Upload CSV</button>
-        </form>
-    </div>
+    pdf_files = [f for f in os.listdir(folder_path) if f.endswith(".pdf")]
 
-    {% if result %}
-    <div class="box result">
-        <h3>Result:</h3>
-        {{ result|safe }}
-    </div>
-    {% endif %}
-</body>
-</html>
-"""
+    if not pdf_files:
+        print("❌ No PDF files found in folder")
+        return
 
-# -------------------------------
-# Load CSV (supports comma + tab)
-# -------------------------------
-def load_csv(file_path):
-    try:
-        return pd.read_csv(file_path, sep=",")
-    except:
-        return pd.read_csv(file_path, sep="\t")
+    # sort by number (file 1, file 2, file 10 correct order)
+    pdf_files.sort(key=extract_number)
 
-# -------------------------------
-# Home Page
-# -------------------------------
-@app.route("/")
-def home():
-    return render_template_string(HTML_PAGE)
+    print("\n📄 Files will be merged in this order:")
+    for f in pdf_files:
+        print(" -", f)
 
-# -------------------------------
-# Upload Endpoint
-# -------------------------------
-@app.route("/upload", methods=["POST"])
-def upload():
-    if "file" not in request.files:
-        return render_template_string(HTML_PAGE, result="❌ No file uploaded")
+    # merge PDFs
+    for pdf in pdf_files:
+        path = os.path.join(folder_path, pdf)
+        print(f"Adding: {pdf}")
 
-    file = request.files["file"]
-    path = os.path.join(UPLOAD_FOLDER, file.filename)
-    file.save(path)
+        reader = PdfReader(path)
 
-    df = load_csv(path)
-    df.columns = [col.strip() for col in df.columns]
+        for page in reader.pages:
+            writer.add_page(page)
 
-    # Validate Columns
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing:
-        return render_template_string(
-            HTML_PAGE,
-            result=f"❌ CSV missing required column(s): {', '.join(missing)}"
-        )
+    # save output
+    with open(output_file, "wb") as f:
+        writer.write(f)
 
-    result_messages = []
+    print(f"\n✅ Merged successfully: {output_file}")
 
-    # -------------------------------
-    # Process Each Order
-    # -------------------------------
-    for _, row in df.iterrows():
-        try:
-            po = str(row["CustomerPO"]).strip()
 
-            payload = {
-                "shippingAddress": {
-                    "customer": row["Attn"],
-                    "attn": row["Attn"],
-                    "address": row["Address"],
-                    "city": row["City"],
-                    "state": row["State"],
-                    "zip": str(row["Zip"]),
-                    "residential": True
-                },
-                "shippingMethod": str(row["ShippingMethod"]),
-                "shipBlind": str(row["shipBlind"]).lower() in ["yes", "1", "true"],
-                "poNumber": po,
-                "emailConfirmation": row["PaymentProfile-Email"],
-                "testOrder": False,
 
-                "paymentProfile": {
-                    "email": row["PaymentProfile-Email"],
-                    "profileID": int(row["PaymentProfileID"])
-                },
+# ===== AUTO PATH FIX =====
+folder_path = os.path.join(os.getcwd(), "pdfs")
+output_file = "merged_output.pdf"
 
-                "autoselectWarehouse": True,
-
-                "lines": [
-                    {
-                        "identifier": row["Identifier"],
-                        "qty": int(row["Qty"])
-                    }
-                ]
-            }
-
-            # -------------------------------
-            # POST Order to SS
-            # -------------------------------
-            response = requests.post(
-                "https://api.ssactivewear.com/v2/orders",
-                json=payload,
-                auth=(USERNAME, PASSWORD)
-            )
-
-            if response.status_code == 200:
-                result_messages.append(f"✔ PO {po} submitted successfully.")
-            else:
-                result_messages.append(
-                    f"<b>❌ PO {po} FAILED — HTTP {response.status_code}</b><br>{response.text}"
-                )
-
-        except Exception as e:
-            result_messages.append(f"❌ Error processing PO {po}: {str(e)}")
-
-    return render_template_string(
-        HTML_PAGE,
-        result="<br>".join(result_messages)
-    )
-
-if __name__ == "__main__":
-    app.run(debug=True)
+merge_pdfs(folder_path, output_file)
